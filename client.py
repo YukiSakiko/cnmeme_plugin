@@ -162,7 +162,7 @@ class CnMemeClient:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.timeout_seconds),
                 cookie_jar=aiohttp.DummyCookieJar(),
-                headers={"Accept": "application/json", "User-Agent": "MaiBot-CnMeme-Plugin/0.1.0"},
+                headers={"Accept": "application/json", "User-Agent": "MaiBot-CnMeme-Plugin/0.1.1"},
                 trust_env=True,
             ) as session:
                 page = await self._search(session, query)
