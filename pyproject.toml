@@ -1,0 +1,29 @@
+[project]
+name = "maibot-cnmeme-plugin"
+version = "0.1.0"
+description = "唯独你没懂——为麦麦理解聊天提供独立的梗百科查询工具"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "aiohttp>=3.8.0",
+    "maibot-plugin-sdk>=2.16.0,<3.0.0",
+    "pydantic>=2.0.0,<3.0.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.12"]
+
+[tool.pytest.ini_options]
+pythonpath = [".."]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "B"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+line-ending = "lf"
