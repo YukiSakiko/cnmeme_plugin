@@ -108,7 +108,7 @@ async def test_exact_title_ignores_body_only_hits_and_quotes_slug(http: FakeHTTP
     slug = "测试/梗 #?"
     http.responses.extend(
         [
-            FakeResponse(page([meme("仅正文提及"), meme(slug, title="目标词")])),
+            FakeResponse(page([meme("仅正文提及"), meme("别名词条", aliases=["目标词"]), meme(slug, title="目标词")])),
             FakeResponse(detail(slug, title="目标词")),
         ]
     )
@@ -117,6 +117,8 @@ async def test_exact_title_ignores_body_only_hits_and_quotes_slug(http: FakeHTTP
 
     assert result["success"] is True and result["found"] is True
     assert result["query"] == "目标词"
+    assert result["searched_queries"] == ["目标词"]
+    assert result["matched_query"] == "目标词"
     assert len(result["items"]) == 1
     assert result["items"][0]["match_type"] == "exact_title"
     assert result["items"][0]["source_url"] == f"{SEARCH_URL}/{quote(slug, safe='')}"
@@ -146,7 +148,7 @@ async def test_keyword_candidates_are_limited_and_body_is_truncated(http: FakeHT
 
 
 async def test_empty_results_are_successful_and_cached(http: FakeHTTP) -> None:
-    http.responses.append(FakeResponse(page([])))
+    http.responses.extend(FakeResponse(page([])) for _ in range(3))
     client = CnMemeClient()
 
     result = await client.lookup("未收录词")
@@ -155,7 +157,228 @@ async def test_empty_results_are_successful_and_cached(http: FakeHTTP) -> None:
     assert result == cached
     assert result["success"] is True and result["found"] is False
     assert result["items"] == []
+    assert result["searched_queries"] == ["未收录词", "未收", "录词"]
+    assert result["matched_query"] is None
+    assert len(http.calls) == 3
+
+
+async def test_sentence_particle_variant_finds_approximate_title_and_stops(http: FakeHTTP) -> None:
+    query = "康神开播啦"
+    title = "康神开播了"
+    http.responses.extend([FakeResponse(page([])), FakeResponse(page([meme(title)])), FakeResponse(detail(title))])
+
+    result = await CnMemeClient().lookup(query)
+
+    assert result["query"] == query
+    assert result["searched_queries"] == [query, "康神开播"]
+    assert result["matched_query"] == "康神开播"
+    assert result["items"][0]["match_type"] == "approximate"
+    assert result["items"][0]["title"] == title
+    assert "近似" in result["content"]
+    assert "康神开播" in result["content"]
+    assert title in result["content"] and "完整释义" in result["content"]
+    assert result["items"][0]["source_url"] in result["content"]
+    assert len(http.calls) == 3
+
+
+@pytest.mark.parametrize("query", ["鸡拟太美", "坤你太美"])
+async def test_typo_in_middle_or_first_character_uses_other_half(http: FakeHTTP, query: str) -> None:
+    http.responses.extend(
+        [
+            FakeResponse(page([])),
+            FakeResponse(page([])),
+            FakeResponse(page([meme("鸡你太美")])),
+            FakeResponse(detail("鸡你太美")),
+        ]
+    )
+
+    result = await CnMemeClient().lookup(query)
+
+    assert result["query"] == query
+    assert result["searched_queries"] == [query, query[:2], "太美"]
+    assert result["matched_query"] == "太美"
+    assert result["items"][0]["match_type"] == "approximate"
+    assert [call[1]["params"]["q"] for call in http.calls if call[0] == SEARCH_URL] == result["searched_queries"]
+
+
+async def test_exact_alias_is_selected_without_expanding_original_search(http: FakeHTTP) -> None:
+    http.responses.extend(
+        [
+            FakeResponse(page([meme("正文提及"), meme("正式标题", aliases=["登记别名"])])),
+            FakeResponse(detail("正式标题", aliases=["登记别名"])),
+        ]
+    )
+
+    result = await CnMemeClient(max_results=1).lookup("登记别名")
+
+    assert result["searched_queries"] == ["登记别名"]
+    assert result["matched_query"] == "登记别名"
+    assert result["items"][0]["title"] == "正式标题"
+    assert result["items"][0]["match_type"] == "exact_alias"
+    assert http.calls[1][0] == f"{SEARCH_URL}/{quote('正式标题', safe='')}"
+    assert len(http.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "nearby",
+    [meme("鸡你太美"), meme("正式词条", aliases=["鸡你太美"])],
+)
+async def test_original_results_rank_near_names_before_body_hits_without_expanding(
+    http: FakeHTTP, nearby: Dict[str, Any]
+) -> None:
+    body_hit = meme("仅正文提及", summary="鸡你太美")
+    http.responses.extend(
+        [
+            FakeResponse(page([body_hit, nearby])),
+            FakeResponse(detail(nearby["slug"])),
+            FakeResponse(detail(body_hit["slug"])),
+        ]
+    )
+
+    result = await CnMemeClient().lookup("鸡拟太美")
+
+    assert result["searched_queries"] == ["鸡拟太美"]
+    assert result["matched_query"] == "鸡拟太美"
+    assert [item["slug"] for item in result["items"]] == [nearby["slug"], body_hit["slug"]]
+    assert all(item["match_type"] == "keyword" for item in result["items"])
+    assert [call[0] for call in http.calls[1:]] == [
+        f"{SEARCH_URL}/{quote(nearby['slug'], safe='')}",
+        f"{SEARCH_URL}/{quote(body_hit['slug'], safe='')}",
+    ]
+
+
+async def test_short_query_does_not_expand(http: FakeHTTP) -> None:
+    http.responses.append(FakeResponse(page([])))
+
+    result = await CnMemeClient().lookup("原神")
+
+    assert result["found"] is False
+    assert result["searched_queries"] == ["原神"]
+    assert result["matched_query"] is None
     assert len(http.calls) == 1
+
+
+async def test_supplement_rejects_two_edits_and_body_or_tag_similarity(http: FakeHTTP) -> None:
+    unrelated = meme("鸡你好美", summary="鸡你太美", tags=["鸡你太美"])
+    http.responses.extend([FakeResponse(page([])), FakeResponse(page([unrelated])), FakeResponse(page([]))])
+
+    result = await CnMemeClient().lookup("鸡拟太美")
+
+    assert result["success"] is True and result["found"] is False
+    assert result["items"] == []
+    assert result["searched_queries"] == ["鸡拟太美", "鸡拟", "太美"]
+    assert result["matched_query"] is None
+    assert all(call[0] == SEARCH_URL for call in http.calls)
+
+
+async def test_registered_alias_can_qualify_approximate_supplement(http: FakeHTTP) -> None:
+    alias_item = meme("篮球问候语", aliases=["鸡你太美"])
+    http.responses.extend(
+        [
+            FakeResponse(page([])),
+            FakeResponse(page([alias_item])),
+            FakeResponse(detail("篮球问候语", aliases=["鸡你太美"])),
+        ]
+    )
+
+    result = await CnMemeClient().lookup("鸡拟太美")
+
+    assert result["searched_queries"] == ["鸡拟太美", "鸡拟"]
+    assert result["matched_query"] == "鸡拟"
+    assert result["items"][0]["title"] == "篮球问候语"
+    assert result["items"][0]["match_type"] == "approximate"
+    assert len(http.calls) == 3
+
+
+@pytest.mark.parametrize("title", ["鸡拟美", "鸡拟很太美"])
+async def test_approximate_supplement_allows_one_character_deletion_or_insertion(http: FakeHTTP, title: str) -> None:
+    http.responses.extend([FakeResponse(page([])), FakeResponse(page([meme(title)])), FakeResponse(detail(title))])
+
+    result = await CnMemeClient().lookup("鸡拟太美")
+
+    assert result["found"] is True
+    assert result["searched_queries"] == ["鸡拟太美", "鸡拟"]
+    assert result["items"][0]["title"] == title
+    assert result["items"][0]["match_type"] == "approximate"
+
+
+async def test_empty_long_query_uses_at_most_three_distinct_supplements(http: FakeHTTP) -> None:
+    http.responses.extend(FakeResponse(page([])) for _ in range(4))
+
+    result = await CnMemeClient().lookup("康神今日开播啦")
+
+    assert result["found"] is False
+    assert result["searched_queries"] == ["康神今日开播啦", "康神今日开播", "康神今", "日开播啦"]
+    assert result["matched_query"] is None
+    assert len(http.calls) == 4
+
+
+async def test_duplicate_half_queries_are_only_searched_once(http: FakeHTTP) -> None:
+    http.responses.extend(FakeResponse(page([])) for _ in range(2))
+
+    result = await CnMemeClient().lookup("哈哈哈哈")
+
+    assert result["searched_queries"] == ["哈哈哈哈", "哈哈"]
+    assert result["matched_query"] is None
+    assert len(http.calls) == 2
+
+
+@pytest.mark.parametrize("max_results", [1, 3])
+async def test_supplement_details_are_limited_and_duplicate_slugs_are_read_once(
+    http: FakeHTTP, max_results: int
+) -> None:
+    http.responses.extend(
+        [
+            FakeResponse(page([])),
+            FakeResponse(page([meme("鸡你太美"), meme("鸡你太美"), meme("鸡拟很太美")])),
+            FakeResponse(detail("鸡你太美")),
+        ]
+    )
+    if max_results > 1:
+        http.responses.append(FakeResponse(detail("鸡拟很太美")))
+
+    result = await CnMemeClient(max_results=max_results).lookup("鸡拟太美")
+
+    detail_urls = [call[0] for call in http.calls if call[0] != SEARCH_URL]
+    assert len(detail_urls) == len(set(detail_urls)) == len(result["items"])
+    assert len(result["items"]) == min(max_results, 2)
+    assert all(item["match_type"] == "approximate" for item in result["items"])
+    assert result["searched_queries"] == ["鸡拟太美", "鸡拟"]
+
+
+@pytest.mark.parametrize("status", [429, 503])
+async def test_supplement_error_stops_expansion_and_is_not_cached(http: FakeHTTP, status: int) -> None:
+    http.responses.extend(
+        [
+            FakeResponse(page([])),
+            FakeResponse(status=status, headers={"Retry-After": "30"}),
+            FakeResponse(page([meme("鸡拟太美")])),
+            FakeResponse(detail("鸡拟太美")),
+        ]
+    )
+    client = CnMemeClient()
+
+    with pytest.raises(CnMemeAPIError) as caught:
+        await client.lookup("鸡拟太美")
+    assert caught.value.status == status
+    assert caught.value.retry_after == "30"
+    assert not client._cache
+    assert [call[1]["params"]["q"] for call in http.calls] == ["鸡拟太美", "鸡拟"]
+
+    assert (await client.lookup("鸡拟太美"))["searched_queries"] == ["鸡拟太美"]
+    assert len(http.calls) == 4
+
+
+async def test_total_timeout_covers_additional_searches(http: FakeHTTP) -> None:
+    http.responses.extend([FakeResponse(page([])), FakeResponse(page([]), gate=asyncio.Event())])
+    client = CnMemeClient(timeout_seconds=0.01)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await client.lookup("鸡拟太美")
+
+    assert len(http.calls) == 2
+    assert not client._cache
+    assert http.active_sessions == 0 and http.closed_sessions == 1
 
 
 async def test_cached_results_are_copies_and_expire(http: FakeHTTP, monkeypatch: pytest.MonkeyPatch) -> None:

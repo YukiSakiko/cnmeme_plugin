@@ -34,6 +34,7 @@ class _MemeItem(BaseModel):
     slug: str
     title: str
     summary: str
+    aliases: List[str] = Field(default_factory=list)
     tags: List[str] = Field(default_factory=list)
     updated_at: Optional[str] = None
 
@@ -82,6 +83,42 @@ def html_to_text(content_html: str) -> str:
     return "\n".join(" ".join(line.split()) for line in "".join(parser.parts).splitlines() if line.strip())
 
 
+def _search_variants(query: str) -> List[str]:
+    """短词不扩展；长词最多尝试去语气字及前后两个连续片段。"""
+    if len(query) < 4:
+        return []
+    variants: List[str] = []
+    stem = query.rstrip("啦了啊呀呢吧嘛哦呗哟喽咯哒")
+    if stem != query and len(stem) >= 3:
+        variants.append(stem)
+    midpoint = len(query) // 2
+    for fragment in (query[:midpoint].strip(), query[midpoint:].strip()):
+        if len(fragment) >= 2 and fragment not in variants:
+            variants.append(fragment)
+    return variants
+
+
+def _is_near_name(query: str, name: str) -> bool:
+    """只容许一次增、删、改字，不把较宽的片段搜索结果直接当成同义词。"""
+    left, right = query.strip().casefold(), name.strip().casefold()
+    if len(left) < 4 or abs(len(left) - len(right)) > 1:
+        return False
+    if left == right:
+        return True
+    if len(left) > len(right):
+        left, right = right, left
+    index = 0
+    while index < len(left) and left[index] == right[index]:
+        index += 1
+    if len(left) == len(right):
+        return left[index + 1 :] == right[index + 1 :]
+    return left[index:] == right[index + 1 :]
+
+
+def _has_near_name(query: str, item: _MemeItem) -> bool:
+    return any(_is_near_name(query, name) for name in (item.title, *item.aliases))
+
+
 class CnMemeClient:
     def __init__(
         self,
@@ -128,22 +165,43 @@ class CnMemeClient:
                 headers={"Accept": "application/json", "User-Agent": "MaiBot-CnMeme-Plugin/0.1.0"},
                 trust_env=True,
             ) as session:
-                raw_page = await self._read_json(session, SEARCH_URL, params={"q": query, "limit": 10})
-                try:
-                    page = _SearchResponse.model_validate(raw_page)
-                except ValidationError as exc:
-                    raise CnMemeAPIError("梗百科搜索响应的格式不符合公开接口约定。") from exc
+                page = await self._search(session, query)
+                searched_queries = [query]
+                matched_query = query if page.items else None
+                items = page.items
+                approximate = False
+                # 原词没有结果才扩展，且必须用完整原词核对候选名称，不能只凭片段命中。
+                if not items:
+                    for variant in _search_variants(query):
+                        searched_queries.append(variant)
+                        variant_page = await self._search(session, variant)
+                        near_items = [item for item in variant_page.items if _has_near_name(query, item)]
+                        if near_items:
+                            page, items = variant_page, near_items
+                            matched_query = variant
+                            approximate = True
+                            break
 
-                # 搜索也会匹配正文；有同名词条时不混入仅在正文提到该词的结果。
-                exact_items = [item for item in page.items if item.title.strip().casefold() == query.casefold()]
-                candidates = (exact_items or page.items)[: self.max_results]
+                # 名称和别名精确命中优先；只有正文提及的结果排在名称接近的结果之后。
+                exact_items = [item for item in items if item.title.strip().casefold() == query.casefold()]
+                alias_items = [
+                    item
+                    for item in items
+                    if any(alias.strip().casefold() == query.casefold() for alias in item.aliases)
+                ]
+                if approximate:
+                    candidates, match_type = items, "approximate"
+                elif exact_items:
+                    candidates, match_type = exact_items, "exact_title"
+                elif alias_items:
+                    candidates, match_type = alias_items, "exact_alias"
+                else:
+                    candidates = sorted(items, key=lambda item: not _has_near_name(query, item))
+                    match_type = "keyword"
+                candidates = list({item.slug: item for item in candidates}.values())[: self.max_results]
                 entries: List[Dict[str, Any]] = []
-                seen_slugs = set()
                 unavailable_count = 0
                 for candidate in candidates:
-                    if candidate.slug in seen_slugs:
-                        continue
-                    seen_slugs.add(candidate.slug)
                     source_url = f"{SEARCH_URL}/{quote(candidate.slug, safe='')}"
                     try:
                         raw_detail = await self._read_json(session, source_url)
@@ -168,12 +226,14 @@ class CnMemeClient:
                             "tags": detail.tags,
                             "updated_at": detail.updated_at,
                             "source_url": source_url,
-                            "match_type": "exact_title" if exact_items else "keyword",
+                            "match_type": match_type,
                         }
                     )
 
         if entries:
             reference_parts = [INTERNAL_REFERENCE_NOTE, f"查询词语：{query}"]
+            if approximate:
+                reference_parts.extend([f"实际检索词语：{matched_query}", "以下是近似匹配，不保证与原词同义。"])
             for index, entry in enumerate(entries, start=1):
                 reference_parts.extend(
                     [
@@ -193,11 +253,20 @@ class CnMemeClient:
             "success": True,
             "found": bool(entries),
             "query": query,
+            "searched_queries": searched_queries,
+            "matched_query": matched_query if entries else None,
             "content": content,
             "items": entries,
             "has_more": page.has_more,
             "unavailable_count": unavailable_count,
         }
+
+    async def _search(self, session: aiohttp.ClientSession, query: str) -> _SearchResponse:
+        raw_page = await self._read_json(session, SEARCH_URL, params={"q": query, "limit": 10})
+        try:
+            return _SearchResponse.model_validate(raw_page)
+        except ValidationError as exc:
+            raise CnMemeAPIError("梗百科搜索响应的格式不符合公开接口约定。") from exc
 
     @staticmethod
     async def _read_json(
