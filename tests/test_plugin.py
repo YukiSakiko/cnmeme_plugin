@@ -30,8 +30,7 @@ def test_only_one_visible_internal_tool_is_registered(plugin: CnMemePlugin) -> N
     assert metadata["visibility"] == "visible"
     assert [parameter["name"] for parameter in metadata["parameters"]] == ["query"]
     assert metadata["parameters"][0]["required"] is True
-    assert "内部参考" in metadata["description"]
-    assert "不要因此主动向用户解释词义" in metadata["description"]
+    assert metadata["description"] == "查询网络梗、黑话、缩写和谐音词的含义，用于理解聊天中不熟悉的词语。"
 
 
 async def test_success_returns_internal_reference_without_host_context(
