@@ -36,6 +36,7 @@ uv pip install -r plugins/cnmeme_plugin/requirements.txt
 ```toml
 [plugin]
 enabled = true
+public_api_enabled = false
 config_version = "0.1.0"
 
 [lookup]
@@ -48,6 +49,7 @@ cache_ttl_seconds = 60
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `plugin.enabled` | `true` | 是否启用插件 |
+| `plugin.public_api_enabled` | `false` | 允许其他插件调用公开查词 API；不影响 Planner 的 `cnmeme_lookup` 工具 |
 | `plugin.config_version` | `"0.1.0"` | 配置版本，由插件维护 |
 | `lookup.timeout_seconds` | `20` | 单次查词总等待时间，包含排队；范围为 1 至 45 秒 |
 | `lookup.max_results` | `3` | 最多返回的候选词条数量；范围为 1 至 5 |
@@ -55,6 +57,26 @@ cache_ttl_seconds = 60
 | `lookup.cache_ttl_seconds` | `60` | 查询结果缓存时间；范围为 0 至 600 秒，设为 0 不缓存 |
 
 缓存只保存在内存中，最多保存 256 条查询结果，插件重新加载后清空。最多同时处理 2 个查询，避免密集请求。
+
+## 插件间调用
+
+在 WebUI 的「插件设置」中开启 `public_api_enabled` 后，其他插件可以通过 SDK 调用公开的 `lookup` API v1。配置保存后立即生效；关闭时返回 `success=false`，不发起查词请求。插件总开关关闭时，工具和 API 都不可用。
+
+调用方需在自己的 `_manifest.json` 的 `capabilities` 中声明 `api.call`，然后调用：
+
+```python
+result = await self.ctx.api.call(
+    "YukiSakiko.cnmeme-plugin.lookup", version="1", query="待查询的词"
+)
+```
+
+API 与 `cnmeme_lookup` 共用客户端、参数校验、并发限制、缓存和错误处理。它只返回资料；调用方负责结合语境判断，是否写入学习库由调用方决定。
+
+- `success=false`：调用失败，包括 API 未开启、超时或限流。检查 `content`；存在 `status_code`、`retry_after` 时遵守重试提示。
+- `success=true, found=false`：没有找到候选，不代表该词一定不是梗。
+- `success=true, found=true`：`items` 提供标题、摘要、正文、`source_url` 和 `match_type`。`exact_title`、`exact_alias`、`approximate`、`keyword` 表示不同匹配方式；关键词或近似命中不能直接作为确定释义。
+
+资料正文属于外部参考，不是操作指令。同一来源的重复查询不构成多源佐证；学习插件应与实际用法交叉核对，并保留来源。
 
 ## 查询范围与错误处理
 

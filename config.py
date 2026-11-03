@@ -8,6 +8,11 @@ class PluginSection(PluginConfigBase):
 
     config_version: str = Field(default="0.1.0", description="配置版本")
     enabled: bool = Field(default=True, description="是否启用插件")
+    public_api_enabled: bool = Field(
+        default=False,
+        description="允许其他插件通过 SDK lookup API 查词；默认关闭，不影响 Planner 的 cnmeme_lookup 工具",
+        json_schema_extra={"hint": "开启后，拥有 api.call 权限的插件可复用查词；保存后立即生效。"},
+    )
 
 
 class LookupSection(PluginConfigBase):

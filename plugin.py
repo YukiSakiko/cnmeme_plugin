@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, Optional
 
-from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, MaiBotPlugin, Tool
+from maibot_sdk import API, CONFIG_RELOAD_SCOPE_SELF, MaiBotPlugin, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 import aiohttp
@@ -38,6 +38,12 @@ class CnMemePlugin(MaiBotPlugin):
             max_content_length=settings.max_content_length,
             cache_ttl_seconds=settings.cache_ttl_seconds,
         )
+
+    @API("lookup", description="查询网络梗候选资料，需结合语境判断相关性。", version="1", public=True)
+    async def lookup_api(self, query: str) -> Dict[str, Any]:
+        if not self.config.plugin.public_api_enabled:
+            return {"success": False, "content": "梗百科公开查询 API 未启用。"}
+        return await self.lookup(query)
 
     @Tool(
         "cnmeme_lookup",

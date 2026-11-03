@@ -20,13 +20,17 @@ def plugin() -> CnMemePlugin:
     return instance
 
 
-def test_only_one_visible_internal_tool_is_registered(plugin: CnMemePlugin) -> None:
+def test_visible_tool_and_public_lookup_api_are_registered(plugin: CnMemePlugin) -> None:
     components = plugin.get_components()
 
-    assert len(components) == 1
-    assert components[0]["type"] == "TOOL"
-    assert components[0]["name"] == "cnmeme_lookup"
-    metadata = components[0]["metadata"]
+    assert len(components) == 2
+    tool = next(component for component in components if component["type"] == "TOOL")
+    api = next(component for component in components if component["type"] == "API")
+    assert api["name"] == "lookup"
+    assert api["metadata"]["public"] is True
+    assert api["metadata"]["version"] == "1"
+    assert tool["name"] == "cnmeme_lookup"
+    metadata = tool["metadata"]
     assert metadata["visibility"] == "visible"
     assert [parameter["name"] for parameter in metadata["parameters"]] == ["query"]
     assert metadata["parameters"][0]["required"] is True
@@ -43,6 +47,19 @@ async def test_success_returns_internal_reference_without_host_context(
 
     assert await plugin.lookup("测试梗", stream_id="not-used") == result
     lookup.assert_awaited_once_with("测试梗")
+    assert (await plugin.lookup_api("测试梗"))["success"] is False
+    lookup.assert_awaited_once_with("测试梗")
+    settings = plugin.get_plugin_config_data()
+    settings["plugin"]["public_api_enabled"] = True
+    plugin.set_plugin_config(settings)
+    await plugin.on_config_update(CONFIG_RELOAD_SCOPE_SELF, settings, "0.1.0")
+    monkeypatch.setattr(plugin._client, "lookup", lookup)
+    assert await plugin.lookup_api("测试梗") == result
+    assert lookup.await_count == 2
+    settings["plugin"]["public_api_enabled"] = False
+    plugin.set_plugin_config(settings)
+    assert (await plugin.lookup_api("测试梗"))["success"] is False
+    assert lookup.await_count == 2
     assert "stop_after_execution" not in result
 
 
@@ -52,9 +69,11 @@ async def test_disabled_plugin_never_performs_lookup(plugin: CnMemePlugin, monke
     monkeypatch.setattr(plugin._client, "lookup", lookup)
     settings = plugin.get_plugin_config_data()
     settings["plugin"]["enabled"] = False
+    settings["plugin"]["public_api_enabled"] = True
     plugin.set_plugin_config(settings)
 
     assert (await plugin.lookup("测试梗"))["success"] is False
+    assert (await plugin.lookup_api("测试梗"))["success"] is False
     lookup.assert_not_awaited()
 
 
