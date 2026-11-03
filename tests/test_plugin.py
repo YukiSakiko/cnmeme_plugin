@@ -1,6 +1,7 @@
 """使用真实 SDK 的配置与组件收集接口验证插件边界。"""
 
 from unittest.mock import AsyncMock
+from types import SimpleNamespace
 
 import asyncio
 
@@ -9,7 +10,7 @@ from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF
 import aiohttp
 import pytest
 
-from cnmeme_plugin.client import CnMemeAPIError
+from cnmeme_plugin.client import CnMemeAPIError, CnMemeClient
 from cnmeme_plugin.plugin import CnMemePlugin, create_plugin
 
 
@@ -144,3 +145,51 @@ async def test_lifecycle_and_self_config_reload_rebuild_client(plugin: CnMemePlu
     assert plugin._client is None
     with pytest.raises(RuntimeError, match="尚未加载"):
         await plugin.lookup("测试梗")
+
+
+async def test_config_reload_shares_capacity_with_inflight_tool_and_api_calls(plugin, monkeypatch):
+    await plugin.on_load()
+    original_client = plugin._client
+    started = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+    peak = 0
+
+    async def search(self, session, query):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        if active == 2:
+            started.set()
+        try:
+            await release.wait()
+            return SimpleNamespace(items=[], has_more=False)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(CnMemeClient, "_search", search)
+    tasks = [asyncio.create_task(plugin.lookup(query)) for query in ("甲", "乙")]
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        settings = plugin.get_plugin_config_data()
+        settings["plugin"]["public_api_enabled"] = True
+        settings["lookup"]["max_results"] = 1
+        plugin.set_plugin_config(settings)
+        await plugin.on_config_update(CONFIG_RELOAD_SCOPE_SELF, settings, "0.1.0")
+        assert plugin._client is not original_client
+        result = await asyncio.wait_for(plugin.lookup_api("丙"), timeout=1)
+        assert result["success"] is False and result["status_code"] == 429
+        assert peak == 2
+        tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tasks[0]
+        release.set()
+        assert (await plugin.lookup_api("丁"))["success"] is True
+        assert (await tasks[1])["success"] is True
+        assert peak == 2 and active == 0
+    finally:
+        release.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await plugin.on_unload()

@@ -18,6 +18,7 @@ class CnMemePlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._client: Optional[CnMemeClient] = None
+        self._lookup_slots = asyncio.Semaphore(2)
 
     async def on_load(self) -> None:
         self._build_client()
@@ -37,6 +38,7 @@ class CnMemePlugin(MaiBotPlugin):
             max_results=settings.max_results,
             max_content_length=settings.max_content_length,
             cache_ttl_seconds=settings.cache_ttl_seconds,
+            lookup_slots=self._lookup_slots,
         )
 
     @API("lookup", description="查询网络梗候选资料，需结合语境判断相关性。", version="1", public=True)

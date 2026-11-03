@@ -51,12 +51,12 @@ cache_ttl_seconds = 60
 | `plugin.enabled` | `true` | 是否启用插件 |
 | `plugin.public_api_enabled` | `false` | 允许其他插件调用公开查词 API；不影响 Planner 的 `cnmeme_lookup` 工具 |
 | `plugin.config_version` | `"0.1.0"` | 配置版本，由插件维护 |
-| `lookup.timeout_seconds` | `20` | 单次查词总等待时间，包含排队；范围为 1 至 45 秒 |
+| `lookup.timeout_seconds` | `20` | 单次查词总等待时间，包含搜索和详情读取；范围为 1 至 45 秒 |
 | `lookup.max_results` | `3` | 最多返回的候选词条数量；范围为 1 至 5 |
 | `lookup.max_content_length` | `3000` | 每条词条正文最多保留的字符数；范围为 200 至 10000 |
 | `lookup.cache_ttl_seconds` | `60` | 查询结果缓存时间；范围为 0 至 600 秒，设为 0 不缓存 |
 
-缓存只保存在内存中，最多保存 256 条查询结果，插件重新加载后清空。最多同时处理 2 个查询，避免密集请求。
+缓存只保存在内存中，最多保存 256 条查询结果，插件重新加载后清空。工具与 API 合计最多同时执行 2 个未缓存查询；满载时额外查询立即返回 `success=false`、`status_code=429`，不排队，缓存命中仍可返回。配置热更新期间，新旧客户端共用这两个槽位；查询完成、失败或取消后释放槽位。
 
 ## 插件间调用
 

@@ -470,13 +470,14 @@ async def test_total_timeout_closes_session_and_does_not_cache(http: FakeHTTP) -
     assert http.active_sessions == 0 and http.closed_sessions == 1
 
 
-async def test_total_timeout_also_covers_waiting_for_query_slot(http: FakeHTTP) -> None:
+async def test_full_capacity_rejects_uncached_queries_without_waiting(http: FakeHTTP) -> None:
     client = CnMemeClient(timeout_seconds=0.01)
     await client._slots.acquire()
     await client._slots.acquire()
     try:
-        with pytest.raises(asyncio.TimeoutError):
+        with pytest.raises(CnMemeAPIError) as caught:
             await client.lookup("测试梗")
+        assert caught.value.status == 429
     finally:
         client._slots.release()
         client._slots.release()
@@ -485,11 +486,16 @@ async def test_total_timeout_also_covers_waiting_for_query_slot(http: FakeHTTP) 
 
 async def test_at_most_two_queries_are_active(http: FakeHTTP) -> None:
     gate = asyncio.Event()
-    http.responses.extend(FakeResponse(page([]), gate=gate) for _ in range(4))
+    http.responses.extend(FakeResponse(page([]), gate=gate) for _ in range(2))
     client = CnMemeClient()
-    tasks = [asyncio.create_task(client.lookup(f"词语{index}")) for index in range(4)]
+    tasks = [asyncio.create_task(client.lookup(f"词语{index}")) for index in range(2)]
     try:
         await asyncio.wait_for(http.two_started.wait(), timeout=1)
+        rejected = await asyncio.wait_for(
+            asyncio.gather(*(client.lookup(f"其他词{index}") for index in range(20)), return_exceptions=True),
+            timeout=1,
+        )
+        assert all(isinstance(error, CnMemeAPIError) and error.status == 429 for error in rejected)
         assert len(http.calls) == 2
         gate.set()
         results = await asyncio.gather(*tasks)
