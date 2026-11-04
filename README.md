@@ -98,6 +98,8 @@ API 与 `cnmeme_lookup` 共用客户端、参数校验、并发限制、缓存�
 uv run --no-sync --project ../.. python -m pytest -c pyproject.toml tests
 uv run --no-sync --project ../.. ruff check .
 ```
+## 致谢
+感谢[Zerlight](https://github.com/Zerlight)对插件的优化
 
 ## 许可证
 
