@@ -127,12 +127,13 @@ class CnMemeClient:
         max_results: int = 3,
         max_content_length: int = 3000,
         cache_ttl_seconds: int = 60,
+        lookup_slots: Optional[asyncio.Semaphore] = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.max_results = max_results
         self.max_content_length = max_content_length
         self.cache_ttl_seconds = cache_ttl_seconds
-        self._slots = asyncio.Semaphore(2)
+        self._slots = lookup_slots if lookup_slots is not None else asyncio.Semaphore(2)
         self._cache: OrderedDict[str, Tuple[float, Dict[str, Any]]] = OrderedDict()
 
     async def lookup(self, query: str) -> Dict[str, Any]:
@@ -147,7 +148,7 @@ class CnMemeClient:
                 return deepcopy(result)
             del self._cache[query]
 
-        # 总超时覆盖排队、搜索和详情读取，避免超过宿主的工具调用时限。
+        # 总超时覆盖搜索和详情读取，避免超过宿主的工具调用时限。
         result = await asyncio.wait_for(self._lookup_uncached(query), timeout=self.timeout_seconds)
         if self.cache_ttl_seconds > 0:
             self._cache[query] = (monotonic() + self.cache_ttl_seconds, deepcopy(result))
@@ -157,6 +158,9 @@ class CnMemeClient:
         return result
 
     async def _lookup_uncached(self, query: str) -> Dict[str, Any]:
+        if self._slots.locked():
+            raise CnMemeAPIError("查词并发已满，请稍后再查。", status=429)
+        # No suspension between the capacity check and an available-slot acquisition.
         async with self._slots:
             # 一次查询共用连接；退出时关闭，不让配置热更新留下旧会话。
             async with aiohttp.ClientSession(

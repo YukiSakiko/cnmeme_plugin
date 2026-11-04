@@ -8,12 +8,17 @@ class PluginSection(PluginConfigBase):
 
     config_version: str = Field(default="0.1.0", description="配置版本")
     enabled: bool = Field(default=True, description="是否启用插件")
+    public_api_enabled: bool = Field(
+        default=False,
+        description="允许其他插件通过 SDK lookup API 查词；默认关闭，不影响 Planner 的 cnmeme_lookup 工具",
+        json_schema_extra={"hint": "开启后，拥有 api.call 权限的插件可复用查词；保存后立即生效。"},
+    )
 
 
 class LookupSection(PluginConfigBase):
     __ui_label__ = "查词设置"
 
-    timeout_seconds: float = Field(default=20.0, ge=1, le=45, description="单次查词总等待时间，包含排队时间，单位为秒")
+    timeout_seconds: float = Field(default=20.0, ge=1, le=45, description="单次查词总等待时间，包含搜索和详情读取，单位为秒")
     max_results: int = Field(default=3, ge=1, le=5, description="最多提供多少个候选词条")
     max_content_length: int = Field(default=3000, ge=200, le=10000, description="每个词条正文最多保留的字数")
     cache_ttl_seconds: int = Field(default=60, ge=0, le=600, description="查询结果缓存时间，单位为秒；设为零时不缓存")

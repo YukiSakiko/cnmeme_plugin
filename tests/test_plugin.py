@@ -1,6 +1,7 @@
 """使用真实 SDK 的配置与组件收集接口验证插件边界。"""
 
 from unittest.mock import AsyncMock
+from types import SimpleNamespace
 
 import asyncio
 
@@ -9,7 +10,7 @@ from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF
 import aiohttp
 import pytest
 
-from cnmeme_plugin.client import CnMemeAPIError
+from cnmeme_plugin.client import CnMemeAPIError, CnMemeClient
 from cnmeme_plugin.plugin import CnMemePlugin, create_plugin
 
 
@@ -20,13 +21,17 @@ def plugin() -> CnMemePlugin:
     return instance
 
 
-def test_only_one_visible_internal_tool_is_registered(plugin: CnMemePlugin) -> None:
+def test_visible_tool_and_public_lookup_api_are_registered(plugin: CnMemePlugin) -> None:
     components = plugin.get_components()
 
-    assert len(components) == 1
-    assert components[0]["type"] == "TOOL"
-    assert components[0]["name"] == "cnmeme_lookup"
-    metadata = components[0]["metadata"]
+    assert len(components) == 2
+    tool = next(component for component in components if component["type"] == "TOOL")
+    api = next(component for component in components if component["type"] == "API")
+    assert api["name"] == "lookup"
+    assert api["metadata"]["public"] is True
+    assert api["metadata"]["version"] == "1"
+    assert tool["name"] == "cnmeme_lookup"
+    metadata = tool["metadata"]
     assert metadata["visibility"] == "visible"
     assert [parameter["name"] for parameter in metadata["parameters"]] == ["query"]
     assert metadata["parameters"][0]["required"] is True
@@ -43,6 +48,19 @@ async def test_success_returns_internal_reference_without_host_context(
 
     assert await plugin.lookup("测试梗", stream_id="not-used") == result
     lookup.assert_awaited_once_with("测试梗")
+    assert (await plugin.lookup_api("测试梗"))["success"] is False
+    lookup.assert_awaited_once_with("测试梗")
+    settings = plugin.get_plugin_config_data()
+    settings["plugin"]["public_api_enabled"] = True
+    plugin.set_plugin_config(settings)
+    await plugin.on_config_update(CONFIG_RELOAD_SCOPE_SELF, settings, "0.1.0")
+    monkeypatch.setattr(plugin._client, "lookup", lookup)
+    assert await plugin.lookup_api("测试梗") == result
+    assert lookup.await_count == 2
+    settings["plugin"]["public_api_enabled"] = False
+    plugin.set_plugin_config(settings)
+    assert (await plugin.lookup_api("测试梗"))["success"] is False
+    assert lookup.await_count == 2
     assert "stop_after_execution" not in result
 
 
@@ -52,9 +70,11 @@ async def test_disabled_plugin_never_performs_lookup(plugin: CnMemePlugin, monke
     monkeypatch.setattr(plugin._client, "lookup", lookup)
     settings = plugin.get_plugin_config_data()
     settings["plugin"]["enabled"] = False
+    settings["plugin"]["public_api_enabled"] = True
     plugin.set_plugin_config(settings)
 
     assert (await plugin.lookup("测试梗"))["success"] is False
+    assert (await plugin.lookup_api("测试梗"))["success"] is False
     lookup.assert_not_awaited()
 
 
@@ -125,3 +145,51 @@ async def test_lifecycle_and_self_config_reload_rebuild_client(plugin: CnMemePlu
     assert plugin._client is None
     with pytest.raises(RuntimeError, match="尚未加载"):
         await plugin.lookup("测试梗")
+
+
+async def test_config_reload_shares_capacity_with_inflight_tool_and_api_calls(plugin, monkeypatch):
+    await plugin.on_load()
+    original_client = plugin._client
+    started = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+    peak = 0
+
+    async def search(self, session, query):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        if active == 2:
+            started.set()
+        try:
+            await release.wait()
+            return SimpleNamespace(items=[], has_more=False)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(CnMemeClient, "_search", search)
+    tasks = [asyncio.create_task(plugin.lookup(query)) for query in ("甲", "乙")]
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        settings = plugin.get_plugin_config_data()
+        settings["plugin"]["public_api_enabled"] = True
+        settings["lookup"]["max_results"] = 1
+        plugin.set_plugin_config(settings)
+        await plugin.on_config_update(CONFIG_RELOAD_SCOPE_SELF, settings, "0.1.0")
+        assert plugin._client is not original_client
+        result = await asyncio.wait_for(plugin.lookup_api("丙"), timeout=1)
+        assert result["success"] is False and result["status_code"] == 429
+        assert peak == 2
+        tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tasks[0]
+        release.set()
+        assert (await plugin.lookup_api("丁"))["success"] is True
+        assert (await tasks[1])["success"] is True
+        assert peak == 2 and active == 0
+    finally:
+        release.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await plugin.on_unload()
