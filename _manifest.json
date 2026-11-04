@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "YukiSakiko.cnmeme-plugin",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "name": "麦麦梗百科插件",
   "description": "唯独你没懂——按需查询网络梗和陌生词，为麦麦理解聊天提供内部参考，不主动发送词义解释。",
   "author": {
