@@ -65,7 +65,15 @@ class LookupSection(PluginConfigBase):
         description="将麦麦查到的明确释义自动收录为全局黑话",
         json_schema_extra={
             "label": "自动收录全局黑话",
-            "hint": "开启后，明确的释义会存入黑话库，供启用了黑话功能的会话使用，不覆盖已有释义。",
+            "hint": "开启后，明确的释义和核对过的相关梗会存入黑话库。相关梗按自己的标题收录，不覆盖已有释义。",
+        },
+    )
+    save_global_expression: bool = Field(
+        default=False,
+        description="将麦麦查到的明确用法自动收录为全局表达",
+        json_schema_extra={
+            "label": "自动收录全局表达",
+            "hint": "开启后，明确的使用情景和说法会存入表达库。不影响黑话收录。仅使用精选表达时，需要先审核。",
         },
     )
 

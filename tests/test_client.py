@@ -239,13 +239,13 @@ async def test_exact_definition_uses_fresh_summary_and_matched_spelling(
     client = CnMemeClient()
 
     lookup = await client.lookup(query)
-    result, definition = await client.lookup_with_definition(query)
+    result, definitions = await client.lookup_with_definitions(query)
 
     assert result == lookup
-    assert definition is not None
+    (definition,) = definitions
     assert definition.term == expected_term
     assert definition.meaning == "指分享好消息。 也可用于自嘲。"
-    assert definition.source_url == f"{SEARCH_URL}/entry"
+    assert result["items"][0]["source_url"] == f"{SEARCH_URL}/entry"
     assert len(http.calls) == 2
 
 
@@ -267,10 +267,10 @@ async def test_exact_definition_requires_an_unambiguous_complete_search_page(
         ]
     )
 
-    result, definition = await CnMemeClient(max_results=1).lookup_with_definition("目标词")
+    result, definitions = await CnMemeClient(max_results=1).lookup_with_definitions("目标词")
 
     assert result["found"] is True and len(result["items"]) == 1
-    assert definition is None
+    assert definitions == ()
 
 
 @pytest.mark.parametrize(
@@ -292,42 +292,198 @@ async def test_exact_definition_rechecks_the_entry_in_fresh_detail(
         ]
     )
 
-    result, definition = await CnMemeClient().lookup_with_definition("目标词")
+    result, definitions = await CnMemeClient().lookup_with_definitions("目标词")
 
     assert result["found"] is found
-    assert definition is None
+    assert definitions == ()
 
 
 @pytest.mark.parametrize("summary", ["   ", "测试梗", "<b>释义</b>", "含有\x00控制字符", "字" * 501])
 async def test_exact_definition_skips_unsuitable_summaries(http: FakeHTTP, summary: str) -> None:
     http.responses.extend([FakeResponse(page([meme()])), FakeResponse(detail(summary=summary))])
 
-    result, definition = await CnMemeClient().lookup_with_definition("测试梗")
+    result, definitions = await CnMemeClient().lookup_with_definitions("测试梗")
 
     assert result["found"] is True
     assert result["items"][0]["content"] == "完整释义"
-    assert definition is None
+    assert definitions == ()
+
+
+@pytest.mark.parametrize("tail", ["后一段被网站截断了…", "字" * 500 + "。"])
+async def test_stored_definition_keeps_complete_sentences_within_length_limit(http: FakeHTTP, tail: str) -> None:
+    full_sentence = "这是完整的释义。"
+    http.responses.extend([FakeResponse(page([meme()])), FakeResponse(detail(summary=full_sentence + tail))])
+
+    result, definitions = await CnMemeClient().lookup_with_definitions("测试梗")
+
+    (definition,) = definitions
+    assert definition.meaning == full_sentence
+    assert len(definition.meaning) <= 500
+    assert result["items"][0]["summary"] == full_sentence + tail
+
+
+@pytest.mark.parametrize(
+    ("summary", "meaning"),
+    [
+        ("来源 “蓝色大肥鱼”是网友使用的戏称。", "“蓝色大肥鱼”是网友使用的戏称。"),
+        ("来源：\n一种聊天中的戏称。", "一种聊天中的戏称。"),
+        ("来源于一张旧梗图。", "来源于一张旧梗图。"),
+    ],
+)
+async def test_definition_drops_leading_heading_without_changing_reference(http: FakeHTTP, summary, meaning) -> None:
+    http.responses.extend([FakeResponse(page([meme()])), FakeResponse(detail(summary=summary))])
+
+    result, (definition,) = await CnMemeClient().lookup_with_definitions("测试梗")
+
+    assert definition.meaning == meaning
+    assert result["items"][0]["summary"] == summary
+    assert result["items"][0]["source_url"] in result["content"]
+
+
+async def test_detail_splits_definition_and_explicit_usage_into_separate_records(http: FakeHTTP) -> None:
+    body = (
+        "<h2><strong>含义</strong></h2><p>这是对某个角色的调侃性称呼。</p>"
+        "<h2>形式与使用</h2><ul><li>讨论这个角色的笨拙举动时，可以说“测试梗又犯迷糊了”。</li></ul>"
+        "<h2>参考资料</h2><p>不应存进释义的内容。</p>"
+    )
+    http.responses.extend(
+        [FakeResponse(page([meme()])), FakeResponse(detail(summary="另一条摘要。", content_html=body))]
+    )
+
+    result, (definition,) = await CnMemeClient().lookup_with_definitions("测试梗")
+
+    assert definition.meaning == "这是对某个角色的调侃性称呼。"
+    assert definition.expression is not None
+    assert definition.expression.situation == "讨论这个角色的笨拙举动时"
+    assert definition.expression.style == "测试梗又犯迷糊了"
+    assert "不应存进释义的内容" in result["items"][0]["content"]
+    assert result["items"][0]["summary"] == "另一条摘要。"
+    assert len(http.calls) == 2
+
+
+async def test_summary_fallback_adds_at_most_one_nonduplicate_background_sentence(http: FakeHTTP) -> None:
+    body = (
+        "<h2>来源</h2><p>测试梗是网友的调侃性称呼。这个称呼来自一次节目。还有后续背景。</p>"
+        "<h2>用法</h2><p>常用来表达惊讶，但没有示例。</p>"
+    )
+    http.responses.extend(
+        [
+            FakeResponse(page([meme()])),
+            FakeResponse(detail(summary="来源 测试梗是网友的调侃性称呼。", content_html=body)),
+        ]
+    )
+
+    _, (definition,) = await CnMemeClient().lookup_with_definitions("测试梗")
+
+    assert definition.meaning == "测试梗是网友的调侃性称呼。 背景：这个称呼来自一次节目。"
+    assert definition.expression is None
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        "在聊天时，例如“和词条无关的一句话”。",
+        "例如“测试梗又出现了”。",
+        "在聊天时，用“测试梗”指代该角色。",
+    ],
+)
+async def test_usage_requires_both_clear_situation_and_explicit_related_example(http: FakeHTTP, usage: str) -> None:
+    http.responses.extend(
+        [FakeResponse(page([meme()])), FakeResponse(detail(content_html=f"<h2>用法</h2><p>{usage}</p>"))]
+    )
+
+    _, (definition,) = await CnMemeClient().lookup_with_definitions("测试梗")
+
+    assert definition.expression is None
 
 
 @pytest.mark.parametrize(
     ("query", "item", "is_approximate", "match_type"),
     [
         ("梗", meme("梗"), False, "exact_title"),
+        ("梗", meme("测试梗"), False, "keyword"),
+        ("AI", meme("Daily News"), False, "keyword"),
         ("测试梗", meme("正文提及", summary="测试梗"), False, "keyword"),
         ("鸡拟太美", meme("鸡你太美"), True, "approximate"),
     ],
 )
-async def test_exact_definition_excludes_single_characters_and_nonexact_matches(
+async def test_definitions_exclude_single_characters_and_unqualified_matches(
     http: FakeHTTP, query: str, item: Dict[str, Any], is_approximate: bool, match_type: str
 ) -> None:
     if is_approximate:
         http.responses.append(FakeResponse(page([])))
     http.responses.extend([FakeResponse(page([item])), FakeResponse(detail(item["slug"]))])
 
-    result, definition = await CnMemeClient().lookup_with_definition(query)
+    result, definitions = await CnMemeClient().lookup_with_definitions(query)
 
     assert result["items"][0]["match_type"] == match_type
-    assert definition is None
+    assert definitions == ()
+
+
+async def test_related_definitions_prioritize_names_and_save_canonical_titles(http: FakeHTTP) -> None:
+    title_hit = meme("奶龙表情包")
+    alias_hit = meme("角色语音合集", aliases=["奶龙语音"])
+    body_hit = meme("其他作品", summary="正文提及奶龙。", tags=["奶龙"])
+    http.responses.extend(
+        [
+            FakeResponse(page([body_hit, alias_hit, title_hit, title_hit], has_more=True)),
+            FakeResponse(detail("奶龙表情包", summary="取自动画的表情图片。")),
+            FakeResponse(detail("角色语音合集", aliases=["奶龙语音"], summary="整理动画里的角色对白。")),
+        ]
+    )
+
+    result, definitions = await CnMemeClient(max_results=2).lookup_with_definitions("奶龙")
+
+    assert result["searched_queries"] == ["奶龙"]
+    assert result["has_more"] is True
+    assert [item["title"] for item in result["items"]] == ["奶龙表情包", "角色语音合集"]
+    assert all(item["match_type"] == "keyword" for item in result["items"])
+    assert [(definition.term, definition.meaning) for definition in definitions] == [
+        ("奶龙表情包", "取自动画的表情图片。"),
+        ("角色语音合集", "整理动画里的角色对白。"),
+    ]
+    assert len(http.calls) == 3
+
+
+async def test_related_definitions_skip_ambiguous_titles_even_outside_candidate_limit(http: FakeHTTP) -> None:
+    http.responses.extend(
+        [
+            FakeResponse(page([meme("first", title="Meme Collection"), meme("second", title=" meme collection ")])),
+            FakeResponse(detail("first", title="Meme Collection")),
+        ]
+    )
+
+    result, definitions = await CnMemeClient(max_results=1).lookup_with_definitions("meme")
+
+    assert len(result["items"]) == 1
+    assert definitions == ()
+
+
+async def test_related_definition_matches_a_standalone_ascii_term(http: FakeHTTP) -> None:
+    title = "Funny AI Art"
+    http.responses.extend([FakeResponse(page([meme(title)])), FakeResponse(detail(title))])
+
+    _, definitions = await CnMemeClient().lookup_with_definitions("ai")
+
+    assert [definition.term for definition in definitions] == [title]
+
+
+@pytest.mark.parametrize(
+    ("search_item", "detail_response"),
+    [
+        (meme("entry", title="奶龙表情包"), detail("entry", title="奶龙头像")),
+        (meme("entry", title="奶龙表情包"), detail("other", title="奶龙表情包")),
+        (meme("entry", title="角色语音", aliases=["奶龙语音"]), detail("entry", title="角色语音")),
+    ],
+)
+async def test_related_definitions_require_consistent_title_slug_and_relation_in_detail(
+    http: FakeHTTP, search_item: Dict[str, Any], detail_response: Dict[str, Any]
+) -> None:
+    http.responses.extend([FakeResponse(page([search_item])), FakeResponse(detail_response)])
+
+    _, definitions = await CnMemeClient().lookup_with_definitions("奶龙")
+
+    assert definitions == ()
 
 
 @pytest.mark.parametrize(

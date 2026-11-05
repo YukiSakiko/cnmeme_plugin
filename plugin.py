@@ -1,7 +1,7 @@
-"""提供内部查词工具，可选收录明确的全局黑话。"""
+"""提供内部查词工具，可选收录明确的全局黑话和表达。"""
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from maibot_sdk import API, CONFIG_RELOAD_SCOPE_SELF, MaiBotPlugin, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
@@ -9,11 +9,11 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 import aiohttp
 import asyncio
 
-from .client import CnMemeAPIError, CnMemeClient, ConfirmedDefinition
+from .client import CnMemeAPIError, CnMemeClient, ConfirmedDefinition, UsageExample
 from .config import CnMemePluginConfig
 
 logger = logging.getLogger(__name__)
-JARGON_SAVE_TIMEOUT_SECONDS = 3.0
+GLOBAL_SAVE_TIMEOUT_SECONDS = 3.0
 
 
 class CnMemePlugin(MaiBotPlugin):
@@ -23,7 +23,7 @@ class CnMemePlugin(MaiBotPlugin):
         super().__init__()
         self._client: Optional[CnMemeClient] = None
         self._lookup_slots = asyncio.Semaphore(2)
-        self._jargon_write_lock = asyncio.Lock()
+        self._global_write_lock = asyncio.Lock()
 
     async def on_load(self) -> None:
         self._build_client()
@@ -67,17 +67,22 @@ class CnMemePlugin(MaiBotPlugin):
     )
     async def lookup(self, query: str, **kwargs: Any) -> Dict[str, Any]:
         del kwargs
-        return await self._lookup(query, save_global=self.config.lookup.save_global_jargon)
+        settings = self.config.lookup
+        return await self._lookup(
+            query,
+            save_jargon=settings.save_global_jargon,
+            save_expression=settings.save_global_expression,
+        )
 
-    async def _lookup(self, query: str, *, save_global: bool = False) -> Dict[str, Any]:
+    async def _lookup(self, query: str, *, save_jargon: bool = False, save_expression: bool = False) -> Dict[str, Any]:
         if not self.config.plugin.enabled:
             return {"success": False, "content": "梗百科插件已停用。"}
         if self._client is None:
             raise RuntimeError("梗百科插件尚未加载。")
-        definition = None
+        definitions: Tuple[ConfirmedDefinition, ...] = ()
         try:
-            if save_global:
-                result, definition = await self._client.lookup_with_definition(query)
+            if save_jargon or save_expression:
+                result, definitions = await self._client.lookup_with_definitions(query)
             else:
                 result = await self._client.lookup(query)
         except ValueError as exc:
@@ -97,16 +102,34 @@ class CnMemePlugin(MaiBotPlugin):
         except aiohttp.ClientError:
             return {"success": False, "content": "无法连接梗百科，本次未取得词义。"}
 
-        if definition is not None:
+        if definitions:
             try:
-                await asyncio.wait_for(self._save_global_jargon(definition), timeout=JARGON_SAVE_TIMEOUT_SECONDS)
-            except Exception:
-                logger.warning("未能自动收录梗百科释义，本次查词结果仍可使用。", exc_info=True)
+                await asyncio.wait_for(
+                    self._save_global_references(definitions, save_jargon=save_jargon, save_expression=save_expression),
+                    timeout=GLOBAL_SAVE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("自动收录超时，本次查词结果仍可使用。", exc_info=True)
         return result
+
+    async def _save_global_references(
+        self, definitions: Tuple[ConfirmedDefinition, ...], *, save_jargon: bool, save_expression: bool
+    ) -> None:
+        for definition in definitions:
+            if save_jargon:
+                try:
+                    await self._save_global_jargon(definition)
+                except Exception:
+                    logger.warning("未能自动收录梗百科释义，本次查词结果仍可使用。", exc_info=True)
+            if save_expression and definition.expression is not None:
+                try:
+                    await self._save_global_expression(definition.expression)
+                except Exception:
+                    logger.warning("未能自动收录梗百科用法，本次查词结果仍可使用。", exc_info=True)
 
     async def _save_global_jargon(self, definition: ConfirmedDefinition) -> None:
         # 宿主没有按词语与范围一起去重的写入接口；同一插件内先查再插，避免并发重复收录。
-        async with self._jargon_write_lock:
+        async with self._global_write_lock:
             if self._client is None or not self.config.plugin.enabled or not self.config.lookup.save_global_jargon:
                 return
             db = self.ctx.db
@@ -119,7 +142,7 @@ class CnMemePlugin(MaiBotPlugin):
                 "Jargon",
                 data={
                     "content": definition.term,
-                    "meaning": f"{definition.meaning}（来源：梗百科，{definition.source_url}）",
+                    "meaning": definition.meaning,
                     "session_id_dict": "{}",
                     "is_jargon": True,
                     "is_complete": True,
@@ -130,6 +153,21 @@ class CnMemePlugin(MaiBotPlugin):
             )
             if not isinstance(saved, dict) or not saved.get("id"):
                 raise RuntimeError("黑话库未确认写入。")
+
+    async def _save_global_expression(self, expression: UsageExample) -> None:
+        async with self._global_write_lock:
+            if self._client is None or not self.config.plugin.enabled or not self.config.lookup.save_global_expression:
+                return
+            db = self.ctx.db
+            fields = {"situation": expression.situation, "style": expression.style, "session_id": None}
+            existing = await db.get("Expression", filters=fields, limit=1)
+            if not isinstance(existing, list):
+                raise RuntimeError("表达库查询返回了未知结果。")
+            if existing:
+                return
+            saved = await db.save("Expression", data={**fields, "content_list": "[]", "checked": False})
+            if not isinstance(saved, dict) or not saved.get("id"):
+                raise RuntimeError("表达库未确认写入。")
 
 
 def create_plugin() -> CnMemePlugin:
