@@ -24,7 +24,7 @@
     {"type": "python_package", "name": "aiohttp", "version_spec": ">=3.8.0"},
     {"type": "python_package", "name": "pydantic", "version_spec": ">=2.0.0,<3.0.0"}
   ],
-  "capabilities": [],
+  "capabilities": ["database.get", "database.save"],
   "i18n": {
     "default_locale": "zh-CN",
     "supported_locales": ["zh-CN"]

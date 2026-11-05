@@ -1,5 +1,6 @@
-"""提供独立的内部查词工具，不发送消息或接入本地黑话库。"""
+"""提供内部查词工具，可选收录明确的全局黑话。"""
 
+import logging
 from typing import Any, Dict, Optional
 
 from maibot_sdk import API, CONFIG_RELOAD_SCOPE_SELF, MaiBotPlugin, Tool
@@ -8,8 +9,11 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 import aiohttp
 import asyncio
 
-from .client import CnMemeAPIError, CnMemeClient
+from .client import CnMemeAPIError, CnMemeClient, ConfirmedDefinition
 from .config import CnMemePluginConfig
+
+logger = logging.getLogger(__name__)
+JARGON_SAVE_TIMEOUT_SECONDS = 3.0
 
 
 class CnMemePlugin(MaiBotPlugin):
@@ -19,6 +23,7 @@ class CnMemePlugin(MaiBotPlugin):
         super().__init__()
         self._client: Optional[CnMemeClient] = None
         self._lookup_slots = asyncio.Semaphore(2)
+        self._jargon_write_lock = asyncio.Lock()
 
     async def on_load(self) -> None:
         self._build_client()
@@ -45,7 +50,7 @@ class CnMemePlugin(MaiBotPlugin):
     async def lookup_api(self, query: str) -> Dict[str, Any]:
         if not self.config.plugin.public_api_enabled:
             return {"success": False, "content": "梗百科公开查询 API 未启用。"}
-        return await self.lookup(query)
+        return await self._lookup(query)
 
     @Tool(
         "cnmeme_lookup",
@@ -62,12 +67,19 @@ class CnMemePlugin(MaiBotPlugin):
     )
     async def lookup(self, query: str, **kwargs: Any) -> Dict[str, Any]:
         del kwargs
+        return await self._lookup(query, save_global=self.config.lookup.save_global_jargon)
+
+    async def _lookup(self, query: str, *, save_global: bool = False) -> Dict[str, Any]:
         if not self.config.plugin.enabled:
             return {"success": False, "content": "梗百科插件已停用。"}
         if self._client is None:
             raise RuntimeError("梗百科插件尚未加载。")
+        definition = None
         try:
-            return await self._client.lookup(query)
+            if save_global:
+                result, definition = await self._client.lookup_with_definition(query)
+            else:
+                result = await self._client.lookup(query)
         except ValueError as exc:
             return {"success": False, "content": str(exc)}
         except asyncio.TimeoutError:
@@ -84,6 +96,40 @@ class CnMemePlugin(MaiBotPlugin):
             return result
         except aiohttp.ClientError:
             return {"success": False, "content": "无法连接梗百科，本次未取得词义。"}
+
+        if definition is not None:
+            try:
+                await asyncio.wait_for(self._save_global_jargon(definition), timeout=JARGON_SAVE_TIMEOUT_SECONDS)
+            except Exception:
+                logger.warning("未能自动收录梗百科释义，本次查词结果仍可使用。", exc_info=True)
+        return result
+
+    async def _save_global_jargon(self, definition: ConfirmedDefinition) -> None:
+        # 宿主没有按词语与范围一起去重的写入接口；同一插件内先查再插，避免并发重复收录。
+        async with self._jargon_write_lock:
+            if self._client is None or not self.config.plugin.enabled or not self.config.lookup.save_global_jargon:
+                return
+            db = self.ctx.db
+            existing = await db.get("Jargon", filters={"content": definition.term, "is_global": True}, limit=1)
+            if not isinstance(existing, list):
+                raise RuntimeError("黑话库查询返回了未知结果。")
+            if existing:
+                return
+            saved = await db.save(
+                "Jargon",
+                data={
+                    "content": definition.term,
+                    "meaning": f"{definition.meaning}（来源：梗百科，{definition.source_url}）",
+                    "session_id_dict": "{}",
+                    "is_jargon": True,
+                    "is_complete": True,
+                    "is_global": True,
+                    # 固定外部释义，不让聊天学习流程重新推断或覆盖。
+                    "created_by": "MANUAL",
+                },
+            )
+            if not isinstance(saved, dict) or not saved.get("id"):
+                raise RuntimeError("黑话库未确认写入。")
 
 
 def create_plugin() -> CnMemePlugin:

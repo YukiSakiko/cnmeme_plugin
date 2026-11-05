@@ -10,7 +10,8 @@ from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF
 import aiohttp
 import pytest
 
-from cnmeme_plugin.client import CnMemeAPIError, CnMemeClient
+from cnmeme_plugin import plugin as plugin_module
+from cnmeme_plugin.client import CnMemeAPIError, CnMemeClient, ConfirmedDefinition
 from cnmeme_plugin.plugin import CnMemePlugin, create_plugin
 
 
@@ -19,6 +20,24 @@ def plugin() -> CnMemePlugin:
     instance = create_plugin()
     instance.set_plugin_config(instance.build_default_config())
     return instance
+
+
+def test_settings_schema_exposes_chinese_labels_and_hints(plugin: CnMemePlugin) -> None:
+    schema = plugin.get_webui_config_schema()
+    fields = {name: field for section in schema["sections"].values() for name, field in section["fields"].items()}
+    labels = {
+        "config_version": "配置版本",
+        "enabled": "启用插件",
+        "public_api_enabled": "允许其他插件查词",
+        "timeout_seconds": "查词等待上限",
+        "max_results": "最多返回词条数",
+        "max_content_length": "词条正文长度上限",
+        "cache_ttl_seconds": "查词结果保留时间",
+        "save_global_jargon": "自动收录全局黑话",
+    }
+
+    assert {name: fields[name]["label"] for name in labels} == labels
+    assert all(fields[name]["hint"] for name in labels)
 
 
 def test_visible_tool_and_public_lookup_api_are_registered(plugin: CnMemePlugin) -> None:
@@ -62,6 +81,124 @@ async def test_success_returns_internal_reference_without_host_context(
     assert (await plugin.lookup_api("测试梗"))["success"] is False
     assert lookup.await_count == 2
     assert "stop_after_execution" not in result
+
+
+@pytest.fixture
+def global_lookup(plugin, monkeypatch):
+    async def setup(definition):
+        settings = plugin.get_plugin_config_data()
+        settings["plugin"]["public_api_enabled"] = True
+        settings["lookup"]["save_global_jargon"] = True
+        plugin.set_plugin_config(settings)
+        await plugin.on_load()
+        result = {"success": True, "found": True, "items": [{"title": "测试梗", "content": "外部正文"}]}
+        monkeypatch.setattr(plugin._client, "lookup", AsyncMock(return_value=result))
+        monkeypatch.setattr(plugin._client, "lookup_with_definition", AsyncMock(return_value=(result, definition)))
+        db = SimpleNamespace(get=AsyncMock(return_value=[]), save=AsyncMock(return_value={"id": 1}))
+        plugin._set_context(SimpleNamespace(db=db))
+        return result, db
+
+    return setup
+
+
+@pytest.fixture
+def definition() -> ConfirmedDefinition:
+    return ConfirmedDefinition("登记别名", "明确的释义。", "https://cnmeme.wiki/api/v1/public/memes/test")
+
+
+async def test_tool_saves_only_confirmed_definition_as_global(plugin, global_lookup, definition):
+    result, db = await global_lookup(definition)
+
+    assert await plugin.lookup("登记别名", stream_id="a-group") == result
+    db.get.assert_awaited_once_with("Jargon", filters={"content": "登记别名", "is_global": True}, limit=1)
+    db.save.assert_awaited_once_with(
+        "Jargon",
+        data={
+            "content": "登记别名",
+            "meaning": f"明确的释义。（来源：梗百科，{definition.source_url}）",
+            "session_id_dict": "{}",
+            "is_jargon": True,
+            "is_complete": True,
+            "is_global": True,
+            "created_by": "MANUAL",
+        },
+    )
+
+
+async def test_public_api_and_unconfirmed_tool_result_do_not_access_db(plugin, global_lookup, definition):
+    result, db = await global_lookup(definition)
+
+    assert await plugin.lookup_api("登记别名") == result
+    plugin._client.lookup_with_definition.assert_not_awaited()
+    plugin._client.lookup_with_definition.return_value = (result, None)
+    assert await plugin.lookup("登记别名") == result
+    db.get.assert_not_awaited()
+    db.save.assert_not_awaited()
+
+
+async def test_global_definition_is_not_overwritten(plugin, global_lookup, definition):
+    result, db = await global_lookup(definition)
+    db.get.return_value = [{"id": 1, "meaning": "原有释义", "is_global": True}]
+
+    assert await plugin.lookup("登记别名") == result
+    db.save.assert_not_awaited()
+
+
+async def test_concurrent_lookups_do_not_insert_same_global_definition_twice(plugin, global_lookup, definition):
+    result, db = await global_lookup(definition)
+    saved = []
+
+    async def get(*args, **kwargs):
+        return list(saved)
+
+    async def save(model, *, data):
+        await asyncio.sleep(0)
+        saved.append(data)
+        return data
+
+    db.get.side_effect = get
+    db.save.side_effect = save
+    assert await asyncio.gather(plugin.lookup("登记别名"), plugin.lookup("登记别名")) == [result, result]
+    assert db.save.await_count == 1
+
+
+@pytest.mark.parametrize("failed_operation", ["get", "save"])
+async def test_database_failure_does_not_change_lookup_response(
+    plugin, global_lookup, definition, failed_operation, caplog
+):
+    result, db = await global_lookup(definition)
+    getattr(db, failed_operation).side_effect = RuntimeError("数据库不可用")
+
+    assert await plugin.lookup("登记别名") == result
+    assert "未能自动收录" in caplog.text
+    if failed_operation == "get":
+        db.save.assert_not_awaited()
+
+
+async def test_database_error_payload_is_not_treated_as_saved(plugin, global_lookup, definition, caplog):
+    result, db = await global_lookup(definition)
+    db.save.return_value = {"success": False, "error": "数据库不可用"}
+
+    assert await plugin.lookup("登记别名") == result
+    assert "黑话库未确认写入" in caplog.text
+
+
+async def test_database_timeout_returns_reference_and_releases_lock(
+    plugin, global_lookup, definition, monkeypatch, caplog
+):
+    result, db = await global_lookup(definition)
+    blocked = asyncio.Event()
+
+    async def blocked_get(*args, **kwargs):
+        await blocked.wait()
+
+    db.get.side_effect = blocked_get
+    monkeypatch.setattr(plugin_module, "JARGON_SAVE_TIMEOUT_SECONDS", 0.05)
+
+    assert await asyncio.wait_for(plugin.lookup("登记别名"), timeout=1) == result
+    db.save.assert_not_awaited()
+    assert "未能自动收录" in caplog.text
+    assert not plugin._jargon_write_lock.locked()
 
 
 async def test_disabled_plugin_never_performs_lookup(plugin: CnMemePlugin, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -220,6 +220,117 @@ async def test_exact_alias_is_selected_without_expanding_original_search(http: F
 
 
 @pytest.mark.parametrize(
+    ("title", "aliases", "query", "expected_term"),
+    [
+        ("Meme Name", [], "  meme name  ", "Meme Name"),
+        ("正式标题", ["无关别名", "Meme Alias"], "meme alias", "Meme Alias"),
+    ],
+)
+async def test_exact_definition_uses_fresh_summary_and_matched_spelling(
+    http: FakeHTTP, title: str, aliases: List[str], query: str, expected_term: str
+) -> None:
+    item = meme("entry", title=title, aliases=aliases)
+    http.responses.extend(
+        [
+            FakeResponse(page([item, item])),
+            FakeResponse(detail("entry", title=title, aliases=aliases, summary="  指分享好消息。   也可用于自嘲。  ")),
+        ]
+    )
+    client = CnMemeClient()
+
+    lookup = await client.lookup(query)
+    result, definition = await client.lookup_with_definition(query)
+
+    assert result == lookup
+    assert definition is not None
+    assert definition.term == expected_term
+    assert definition.meaning == "指分享好消息。 也可用于自嘲。"
+    assert definition.source_url == f"{SEARCH_URL}/entry"
+    assert len(http.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("other_items", "has_more"),
+    [
+        ([meme("同名条目", title="目标词")], False),
+        ([meme("另一个词", aliases=["目标词"])], False),
+        ([], True),
+    ],
+)
+async def test_exact_definition_requires_an_unambiguous_complete_search_page(
+    http: FakeHTTP, other_items: List[Dict[str, Any]], has_more: bool
+) -> None:
+    http.responses.extend(
+        [
+            FakeResponse(page([meme("目标词"), *other_items], has_more=has_more)),
+            FakeResponse(detail("目标词")),
+        ]
+    )
+
+    result, definition = await CnMemeClient(max_results=1).lookup_with_definition("目标词")
+
+    assert result["found"] is True and len(result["items"]) == 1
+    assert definition is None
+
+
+@pytest.mark.parametrize(
+    ("search_item", "detail_response", "found"),
+    [
+        (meme("原词条", title="目标词"), detail("原词条", title="已改名"), True),
+        (meme("原词条", aliases=["目标词"]), detail("原词条"), True),
+        (meme("原词条", title="目标词"), detail("其他词条", title="目标词"), True),
+        (meme("原词条", title="目标词"), None, False),
+    ],
+)
+async def test_exact_definition_rechecks_the_entry_in_fresh_detail(
+    http: FakeHTTP, search_item: Dict[str, Any], detail_response: Optional[Dict[str, Any]], found: bool
+) -> None:
+    http.responses.extend(
+        [
+            FakeResponse(page([search_item])),
+            FakeResponse(detail_response) if detail_response is not None else FakeResponse(status=404),
+        ]
+    )
+
+    result, definition = await CnMemeClient().lookup_with_definition("目标词")
+
+    assert result["found"] is found
+    assert definition is None
+
+
+@pytest.mark.parametrize("summary", ["   ", "测试梗", "<b>释义</b>", "含有\x00控制字符", "字" * 501])
+async def test_exact_definition_skips_unsuitable_summaries(http: FakeHTTP, summary: str) -> None:
+    http.responses.extend([FakeResponse(page([meme()])), FakeResponse(detail(summary=summary))])
+
+    result, definition = await CnMemeClient().lookup_with_definition("测试梗")
+
+    assert result["found"] is True
+    assert result["items"][0]["content"] == "完整释义"
+    assert definition is None
+
+
+@pytest.mark.parametrize(
+    ("query", "item", "is_approximate", "match_type"),
+    [
+        ("梗", meme("梗"), False, "exact_title"),
+        ("测试梗", meme("正文提及", summary="测试梗"), False, "keyword"),
+        ("鸡拟太美", meme("鸡你太美"), True, "approximate"),
+    ],
+)
+async def test_exact_definition_excludes_single_characters_and_nonexact_matches(
+    http: FakeHTTP, query: str, item: Dict[str, Any], is_approximate: bool, match_type: str
+) -> None:
+    if is_approximate:
+        http.responses.append(FakeResponse(page([])))
+    http.responses.extend([FakeResponse(page([item])), FakeResponse(detail(item["slug"]))])
+
+    result, definition = await CnMemeClient().lookup_with_definition(query)
+
+    assert result["items"][0]["match_type"] == match_type
+    assert definition is None
+
+
+@pytest.mark.parametrize(
     "nearby",
     [meme("鸡你太美"), meme("正式词条", aliases=["鸡你太美"])],
 )
