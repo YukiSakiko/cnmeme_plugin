@@ -54,12 +54,18 @@ class CnMemePlugin(MaiBotPlugin):
 
     @Tool(
         "cnmeme_lookup",
-        description="查询网络梗、黑话、缩写和谐音词的含义，用于理解聊天中不熟悉的词语。",
+        description=(
+            "遇到不熟悉的网络梗、黑话、缩写或谐音词，如果不弄懂它就难以理解当前消息，优先查词，再决定怎么回应。"
+            "有人明确询问词义而你不确定时也可以查；不影响理解的陌生词不用查。"
+        ),
         parameters=[
             ToolParameterInfo(
                 name="query",
                 param_type=ToolParamType.STRING,
-                description="需要理解的单个词语或短语，一至八十个字符",
+                description=(
+                    "只填要查的一个词语或短语，一至八十个字符。知道常见写法时用常见写法，不确定就用原词。"
+                    "不要附加其他关键词或整句聊天。"
+                ),
                 required=True,
             )
         ],

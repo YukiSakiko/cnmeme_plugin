@@ -56,7 +56,9 @@ def test_visible_tool_and_public_lookup_api_are_registered(plugin: CnMemePlugin)
     assert metadata["visibility"] == "visible"
     assert [parameter["name"] for parameter in metadata["parameters"]] == ["query"]
     assert metadata["parameters"][0]["required"] is True
-    assert metadata["description"] == "查询网络梗、黑话、缩写和谐音词的含义，用于理解聊天中不熟悉的词语。"
+    assert "如果不弄懂它就难以理解当前消息，优先查词" in metadata["description"]
+    assert "不影响理解的陌生词不用查" in metadata["description"]
+    assert "知道常见写法时用常见写法，不确定就用原词" in metadata["parameters"][0]["description"]
 
 
 async def test_success_returns_internal_reference_without_host_context(

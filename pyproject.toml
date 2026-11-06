@@ -1,6 +1,6 @@
 [project]
 name = "maibot-cnmeme-plugin"
-version = "0.1.1"
+version = "0.1.4"
 description = "唯独你没懂——为麦麦理解聊天提供独立的梗百科查询工具"
 readme = "README.md"
 requires-python = ">=3.10"
